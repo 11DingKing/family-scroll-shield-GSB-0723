@@ -1,0 +1,43 @@
+spring:
+  datasource:
+    url: jdbc:h2:mem:scrollshield_test;DB_CLOSE_DELAY=-1;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DEFAULT_NULL_ORDERING=HIGH
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+    open-in-view: false
+    database-platform: org.hibernate.dialect.H2Dialect
+    properties:
+      hibernate:
+        jdbc:
+          batch_size: 20
+        order_inserts: true
+        order_updates: true
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      timeout: 500ms
+      lettuce:
+        pool:
+          max-active: 10
+          max-idle: 5
+          min-idle: 1
+  sql:
+    init:
+      mode: never
+
+app:
+  lease:
+    heartbeat-interval-seconds: 2
+    max-session-duration-seconds: 900
+    grace-period-seconds: 1
+  outbox:
+    polling-interval-ms: 100
+    batch-size: 50
+
+logging:
+  level:
+    com.family.scrollshield: DEBUG
