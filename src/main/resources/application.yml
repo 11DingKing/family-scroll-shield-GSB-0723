@@ -2,7 +2,7 @@ spring:
   application:
     name: family-scroll-shield
   datasource:
-    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:scrollshield}
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:scrollshield}?sslmode=disable
     username: ${DB_USER:postgres}
     password: ${DB_PASS:postgres}
     hikari:

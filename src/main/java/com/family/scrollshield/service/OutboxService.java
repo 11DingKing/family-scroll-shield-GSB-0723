@@ -28,7 +28,11 @@ public class OutboxService {
     private final RestClient outboxRestClient;
 
     @Value("${app.outbox.webhook-url:}")
-    private String webhookUrl;
+    private volatile String webhookUrl;
+
+    public void setWebhookUrl(String webhookUrl) {
+        this.webhookUrl = webhookUrl;
+    }
 
     @Value("${app.outbox.max-retries:5}")
     private int maxRetries;
