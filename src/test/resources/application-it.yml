@@ -1,0 +1,50 @@
+spring:
+  task:
+    scheduling:
+      enabled: false
+  datasource:
+    url: jdbc:postgresql://localhost:5434/scrollshield?sslmode=disable
+    username: postgres
+    password: postgres
+    hikari:
+      maximum-pool-size: 30
+      minimum-idle: 5
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+    open-in-view: false
+    database-platform: org.hibernate.dialect.PostgreSQLDialect
+    properties:
+      hibernate:
+        jdbc:
+          batch_size: 20
+        order_inserts: true
+        order_updates: true
+  data:
+    redis:
+      host: localhost
+      port: 6380
+      timeout: 1000ms
+      lettuce:
+        pool:
+          max-active: 20
+          max-idle: 10
+          min-idle: 5
+  sql:
+    init:
+      mode: never
+
+app:
+  lease:
+    heartbeat-interval-seconds: 10
+    max-session-duration-seconds: 900
+    grace-period-seconds: 5
+  outbox:
+    polling-interval-ms: 500
+    batch-size: 50
+    webhook-url: ""
+    max-retries: 3
+
+logging:
+  level:
+    com.family.scrollshield: INFO
