@@ -1,0 +1,73 @@
+plugins {
+    id 'java'
+    id 'org.springframework.boot' version '3.3.5'
+    id 'io.spring.dependency-management' version '1.1.6'
+}
+
+group = 'com.family'
+version = '1.0.0'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+ext {
+    testcontainersVersion = '1.20.4'
+}
+
+dependencies {
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
+    implementation 'org.springframework.boot:spring-boot-starter-data-redis'
+    implementation 'org.springframework.boot:spring-boot-starter-validation'
+    implementation 'org.springframework.boot:spring-boot-starter-actuator'
+    implementation 'org.flywaydb:flyway-core'
+    implementation 'org.flywaydb:flyway-database-postgresql'
+    runtimeOnly 'org.postgresql:postgresql'
+
+    compileOnly 'org.projectlombok:lombok'
+    annotationProcessor 'org.projectlombok:lombok'
+    testCompileOnly 'org.projectlombok:lombok'
+    testAnnotationProcessor 'org.projectlombok:lombok'
+
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    testImplementation 'org.testcontainers:junit-jupiter'
+    testImplementation 'org.testcontainers:postgresql'
+    testImplementation "com.redis:testcontainers-redis:2.2.2"
+}
+
+dependencyManagement {
+    imports {
+        mavenBom "org.testcontainers:testcontainers-bom:${testcontainersVersion}"
+    }
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
+    testLogging {
+        events "passed", "skipped", "failed"
+        exceptionFormat "full"
+    }
+    // Concurrency tests need a reasonable heap; keep a single fork for shared containers.
+    maxHeapSize = "1g"
+
+    // Ensure Testcontainers can locate the Docker daemon (OrbStack/Docker Desktop) even
+    // when the Gradle test JVM does not inherit the shell environment.
+    def dockerHost = System.getenv("DOCKER_HOST") ?: "unix:///var/run/docker.sock"
+    environment "DOCKER_HOST", dockerHost
+    environment "TESTCONTAINERS_RYUK_DISABLED", "true"
+    // OrbStack rejects the default negotiated API version (1.32); pin a modern one.
+    environment "DOCKER_API_VERSION", (System.getenv("DOCKER_API_VERSION") ?: "1.43")
+    systemProperty "docker.host", dockerHost
+    systemProperty "api.version", (System.getenv("DOCKER_API_VERSION") ?: "1.43")
+    systemProperty "testcontainers.ryuk.disabled", "true"
+    doFirst {
+        logger.lifecycle("Using DOCKER_HOST=${dockerHost} for Testcontainers")
+    }
+}
