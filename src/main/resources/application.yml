@@ -1,0 +1,49 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: family-scroll-shield
+  datasource:
+    url: jdbc:postgresql://localhost:5432/scrollshield
+    username: scrollshield
+    password: scrollshield
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 5
+      connection-timeout: 3000
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      timeout: 500ms
+      lettuce:
+        pool:
+          max-active: 16
+          max-idle: 8
+          min-idle: 2
+
+scrollshield:
+  lease:
+    heartbeat-interval-seconds: 30
+    expiry-margin-seconds: 90
+    max-clock-skew-seconds: 5
+  outbox:
+    retention-days: 30
+  node-id: ${HOSTNAME:node-1}
+
+logging:
+  level:
+    com.family.scrollshield: INFO
+    org.springframework.transaction: INFO
