@@ -23,7 +23,7 @@ public class SessionLease {
     @Column(name = "lease_token", unique = true, nullable = false)
     private UUID leaseToken;
 
-    @ManyToOne(fetch = FetchType.LAZY, optional = false)
+    @ManyToOne(fetch = FetchType.EAGER, optional = false)
     @JoinColumn(name = "member_id", nullable = false)
     private FamilyMember member;
 
@@ -48,6 +48,14 @@ public class SessionLease {
 
     @Column(name = "last_heartbeat_at")
     private Instant lastHeartbeatAt;
+
+    @Column(name = "heartbeat_seq", nullable = false)
+    @Builder.Default
+    private Long heartbeatSeq = 0L;
+
+    @Column(name = "last_client_seq", nullable = false)
+    @Builder.Default
+    private Long lastClientSeq = 0L;
 
     @Column(name = "ended_at")
     private Instant endedAt;

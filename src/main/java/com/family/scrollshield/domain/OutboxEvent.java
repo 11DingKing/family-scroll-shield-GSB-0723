@@ -47,6 +47,10 @@ public class OutboxEvent {
     @Column(nullable = false)
     private OutboxStatus status;
 
+    @Column(name = "retry_count", nullable = false)
+    @Builder.Default
+    private Integer retryCount = 0;
+
     @PrePersist
     protected void onCreate() {
         Instant now = Instant.now();

@@ -17,6 +17,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.time.*;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 @Slf4j
 @Service
@@ -58,7 +59,8 @@ public class LeaseRecoveryService {
         List<SessionLease> stale = leaseRepository.findStaleActiveLeases(staleBefore, now);
         for (SessionLease lease : stale) {
             try {
-                log.info("Taking over stale lease: {} lastHb={}", lease.getLeaseToken(), lease.getLastHeartbeatAt());
+                log.info("Taking over stale lease: {} lastHb={} seq={}",
+                        lease.getLeaseToken(), lease.getLastHeartbeatAt(), lease.getHeartbeatSeq());
                 leaseService.takeoverLease(lease, now);
             } catch (Exception e) {
                 log.error("Error taking over stale lease {}: {}", lease.getLeaseToken(), e.getMessage(), e);
@@ -66,29 +68,47 @@ public class LeaseRecoveryService {
         }
     }
 
-    @Scheduled(cron = "0 5 0 * * *")
+    @Scheduled(fixedDelayString = "PT5M")
     @Transactional
-    public void crossMidnightSettlement() {
+    public void settleCrossMidnightLeases() {
         Instant now = Instant.now();
         List<FamilyMember> members = memberRepository.findAll();
 
         for (FamilyMember member : members) {
             try {
-                ZoneId zoneId = timezoneService.getZoneId(member.getTimezone());
-                LocalDate today = timezoneService.getLocalDate(now, zoneId);
-                LocalDate yesterday = today.minusDays(1);
-
-                DailyUsage yesterdayUsage = dailyUsageRepository.findByMemberIdAndUsageDate(member.getId(), yesterday).orElse(null);
-                if (yesterdayUsage != null) {
-                    SessionLease activeLease = leaseRepository.findActiveByMemberId(member.getId()).orElse(null);
-                    if (activeLease != null) {
-                        leaseService.expireLease(activeLease, now);
-                    }
-                    log.info("Cross-midnight settlement for member {} on {}: used={}min remaining={}min",
-                            member.getMemberUuid(), yesterday, yesterdayUsage.getUsedMinutes(), yesterdayUsage.getRemainingMinutes());
-                }
+                settleMemberIfCrossedMidnight(member, now);
             } catch (Exception e) {
-                log.error("Error in cross-midnight settlement for member {}: {}", member.getMemberUuid(), e.getMessage(), e);
+                log.error("Error in midnight settlement for member {}: {}", member.getMemberUuid(), e.getMessage(), e);
+            }
+        }
+    }
+
+    @Transactional
+    public void settleMemberIfCrossedMidnight(FamilyMember member, Instant now) {
+        ZoneId zoneId = timezoneService.getZoneId(member.getTimezone());
+        LocalDate today = timezoneService.getLocalDate(now, zoneId);
+        Instant localMidnightToday = today.atStartOfDay(zoneId).toInstant();
+
+        SessionLease activeLease = leaseRepository.findActiveByMemberIdForUpdate(member.getId()).orElse(null);
+        if (activeLease == null) {
+            return;
+        }
+
+        if (activeLease.getStartedAt().isBefore(localMidnightToday)) {
+            LocalDate leaseStartDate = timezoneService.getLocalDate(activeLease.getStartedAt(), zoneId);
+
+            log.info("Cross-midnight settlement: member={} lease started on {} (now {}) in timezone {}",
+                    member.getMemberUuid(), leaseStartDate, today, member.getTimezone());
+
+            leaseService.expireLease(activeLease, localMidnightToday);
+
+            DailyUsage yesterdayUsage = dailyUsageRepository
+                    .findByMemberIdAndUsageDate(member.getId(), leaseStartDate).orElse(null);
+            if (yesterdayUsage != null) {
+                log.info("Settled usage for member {} on {}: used={}min remaining={}min extensions={}",
+                        member.getMemberUuid(), leaseStartDate,
+                        yesterdayUsage.getUsedMinutes(), yesterdayUsage.getRemainingMinutes(),
+                        yesterdayUsage.getExtensionsUsed());
             }
         }
     }
@@ -100,10 +120,10 @@ public class LeaseRecoveryService {
             if (activeLease.isPresent()) {
                 SessionLease lease = activeLease.get();
                 long ttlSec = Math.max(60, Duration.between(Instant.now(), lease.getExpiresAt()).getSeconds() + 60);
-                redisTemplate.opsForValue().set(memberKey, lease.getLeaseToken().toString(), ttlSec, java.util.concurrent.TimeUnit.SECONDS);
+                redisTemplate.opsForValue().set(memberKey, lease.getLeaseToken().toString(), ttlSec, TimeUnit.SECONDS);
                 redisTemplate.opsForValue().set(LEASE_CACHE_PREFIX + lease.getLeaseToken(),
-                        memberId + ":ACTIVE", ttlSec, java.util.concurrent.TimeUnit.SECONDS);
-                log.debug("Reconciled lease cache for member {} from DB", memberId);
+                        memberId + ":ACTIVE", ttlSec, TimeUnit.SECONDS);
+                log.debug("Reconciled lease cache for member {} from DB (token={})", memberId, lease.getLeaseToken());
             } else {
                 redisTemplate.delete(memberKey);
                 log.debug("Cleared lease cache for member {} (no active lease in DB)", memberId);

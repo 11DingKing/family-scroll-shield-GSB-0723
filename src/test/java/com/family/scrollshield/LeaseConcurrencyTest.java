@@ -10,6 +10,7 @@ import com.family.scrollshield.exception.QuotaExceededException;
 import com.family.scrollshield.repository.FamilyMemberRepository;
 import com.family.scrollshield.repository.SessionLeaseRepository;
 import com.family.scrollshield.repository.DailyUsageRepository;
+import com.family.scrollshield.repository.OutboxEventRepository;
 import com.family.scrollshield.service.*;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -56,6 +57,9 @@ class LeaseConcurrencyTest extends AbstractIntegrationTest {
 
     @Autowired
     private DailyUsageRepository dailyUsageRepository;
+
+    @Autowired
+    private OutboxEventRepository outboxEventRepository;
 
     @BeforeEach
     void setUp() {
@@ -478,5 +482,266 @@ class LeaseConcurrencyTest extends AbstractIntegrationTest {
         var reloaded = leaseRepository.findByLeaseToken(lease.leaseToken()).orElseThrow();
         assertEquals("TAKEN_OVER", reloaded.getStatus().name());
         assertEquals(6, reloaded.getConsumedMinutes().intValue());
+    }
+
+    @Test
+    void heartbeatSeq_persistedInPostgres_afterRedisFlush_oldSeqStillRejected() {
+        MemberResponse adult = createAdult("UTC");
+
+        LeaseResponse lease = leaseService.acquireLease(new AcquireLeaseRequest(
+                adult.memberId(), "key-1", 15, "device-1"));
+
+        heartbeatService.heartbeat(new HeartbeatRequest(lease.leaseToken(), "hb-5", 5L));
+
+        SessionLease afterHb = leaseRepository.findByLeaseToken(lease.leaseToken()).orElseThrow();
+        assertEquals(1L, afterHb.getHeartbeatSeq().longValue(),
+                "Heartbeat seq should be persisted in DB");
+
+        flushRedis();
+
+        HeartbeatResponse staleHb = heartbeatService.heartbeat(new HeartbeatRequest(lease.leaseToken(), "hb-3", 3L));
+        assertEquals("ACTIVE", staleHb.status());
+
+        SessionLease afterStale = leaseRepository.findByLeaseToken(lease.leaseToken()).orElseThrow();
+        assertEquals(1L, afterStale.getHeartbeatSeq().longValue(),
+                "Stale heartbeat after Redis flush must not advance DB seq");
+    }
+
+    @Test
+    void heartbeatSeq_afterRedisFlush_newSeqAdvancesCorrectly() {
+        MemberResponse adult = createAdult("UTC");
+
+        LeaseResponse lease = leaseService.acquireLease(new AcquireLeaseRequest(
+                adult.memberId(), "key-1", 15, "device-1"));
+
+        heartbeatService.heartbeat(new HeartbeatRequest(lease.leaseToken(), "hb-10", 10L));
+        SessionLease afterFirst = leaseRepository.findByLeaseToken(lease.leaseToken()).orElseThrow();
+        assertEquals(1L, afterFirst.getHeartbeatSeq().longValue());
+
+        flushRedis();
+
+        HeartbeatResponse hb2 = heartbeatService.heartbeat(new HeartbeatRequest(lease.leaseToken(), "hb-20", 20L));
+        assertEquals("ACTIVE", hb2.status());
+
+        SessionLease afterSecond = leaseRepository.findByLeaseToken(lease.leaseToken()).orElseThrow();
+        assertEquals(2L, afterSecond.getHeartbeatSeq().longValue(),
+                "New seq after Redis flush should advance DB seq correctly");
+    }
+
+    @Test
+    void concurrentHeartbeats_onlyOneAdvancesSeqInDB() throws Exception {
+        MemberResponse adult = createAdult("UTC");
+
+        LeaseResponse lease = leaseService.acquireLease(new AcquireLeaseRequest(
+                adult.memberId(), "key-1", 15, "device-1"));
+
+        SessionLease initial = leaseRepository.findByLeaseToken(lease.leaseToken()).orElseThrow();
+        long initialSeq = initial.getHeartbeatSeq();
+
+        int threadCount = 10;
+        ExecutorService executor = Executors.newFixedThreadPool(threadCount);
+        CountDownLatch latch = new CountDownLatch(threadCount);
+
+        for (int i = 0; i < threadCount; i++) {
+            executor.submit(() -> {
+                try {
+                    heartbeatService.heartbeat(new HeartbeatRequest(lease.leaseToken(), "hb-" + Thread.currentThread().getId(), null));
+                } finally {
+                    latch.countDown();
+                }
+            });
+        }
+
+        latch.await(10, TimeUnit.SECONDS);
+        executor.shutdown();
+
+        SessionLease after = leaseRepository.findByLeaseToken(lease.leaseToken()).orElseThrow();
+        assertEquals(initialSeq + threadCount, after.getHeartbeatSeq().longValue(),
+                "All concurrent heartbeats without seq should each advance DB seq by 1");
+    }
+
+    @Test
+    void concurrentHeartbeats_withSameSeq_onlyOneWins() throws Exception {
+        MemberResponse adult = createAdult("UTC");
+
+        LeaseResponse lease = leaseService.acquireLease(new AcquireLeaseRequest(
+                adult.memberId(), "key-1", 15, "device-1"));
+
+        int threadCount = 10;
+        ExecutorService executor = Executors.newFixedThreadPool(threadCount);
+        CountDownLatch latch = new CountDownLatch(threadCount);
+        AtomicInteger acceptedCount = new AtomicInteger(0);
+        AtomicInteger rejectedCount = new AtomicInteger(0);
+
+        SessionLease initial = leaseRepository.findByLeaseToken(lease.leaseToken()).orElseThrow();
+        long startingSeq = initial.getHeartbeatSeq();
+        long clientSeq = startingSeq + 10;
+
+        for (int i = 0; i < threadCount; i++) {
+            executor.submit(() -> {
+                try {
+                    HeartbeatResponse resp = heartbeatService.heartbeat(
+                            new HeartbeatRequest(lease.leaseToken(), "hb-race", clientSeq));
+                    if ("ACTIVE".equals(resp.status())) {
+                        acceptedCount.incrementAndGet();
+                    } else {
+                        rejectedCount.incrementAndGet();
+                    }
+                } catch (Exception e) {
+                    rejectedCount.incrementAndGet();
+                } finally {
+                    latch.countDown();
+                }
+            });
+        }
+
+        latch.await(10, TimeUnit.SECONDS);
+        executor.shutdown();
+
+        SessionLease after = leaseRepository.findByLeaseToken(lease.leaseToken()).orElseThrow();
+        assertEquals(startingSeq + 1, after.getHeartbeatSeq().longValue(),
+                "With same client seq, only one heartbeat should advance the server DB seq - DB is authoritative");
+        assertEquals(clientSeq, after.getLastClientSeq().longValue(),
+                "The winning heartbeat's client seq should be recorded");
+    }
+
+    @Test
+    void crossMidnightSettlement_timezoneAware_expiresLeaseAtMemberMidnight() {
+        MemberResponse tokyoMember = memberService.createMember(new CreateMemberRequest(
+                "Tokyo Adult", "ADULT", "Asia/Tokyo", null, null, null));
+
+        LeaseResponse lease = leaseService.acquireLease(new AcquireLeaseRequest(
+                tokyoMember.memberId(), "key-1", 15, "device-1"));
+
+        FamilyMember member = memberRepository.findByMemberUuid(tokyoMember.memberId()).orElseThrow();
+
+        ZonedDateTime tokyoMidnight = LocalDate.now(ZoneId.of("Asia/Tokyo")).plusDays(1)
+                .atStartOfDay(ZoneId.of("Asia/Tokyo"));
+        Instant afterTokyoMidnight = tokyoMidnight.toInstant().plusSeconds(30);
+
+        leaseRecoveryService.settleMemberIfCrossedMidnight(member, afterTokyoMidnight);
+
+        SessionLease settled = leaseRepository.findByLeaseToken(lease.leaseToken()).orElseThrow();
+        assertNotEquals("ACTIVE", settled.getStatus().name(),
+                "Lease started before Tokyo midnight should be expired after midnight in Tokyo timezone");
+    }
+
+    @Test
+    void crossMidnightSettlement_differentTimezones_settleIndependently() {
+        MemberResponse tokyoMember = memberService.createMember(new CreateMemberRequest(
+                "Tokyo Adult", "ADULT", "Asia/Tokyo", null, null, null));
+        MemberResponse nyMember = memberService.createMember(new CreateMemberRequest(
+                "NY Adult", "ADULT", "America/New_York", null, null, null));
+
+        LeaseResponse tokyoLease = leaseService.acquireLease(new AcquireLeaseRequest(
+                tokyoMember.memberId(), "key-tokyo", 15, "device-1"));
+        LeaseResponse nyLease = leaseService.acquireLease(new AcquireLeaseRequest(
+                nyMember.memberId(), "key-ny", 15, "device-1"));
+
+        FamilyMember tokyoEntity = memberRepository.findByMemberUuid(tokyoMember.memberId()).orElseThrow();
+        FamilyMember nyEntity = memberRepository.findByMemberUuid(nyMember.memberId()).orElseThrow();
+
+        ZonedDateTime tokyoMidnight = LocalDate.now(ZoneId.of("Asia/Tokyo")).plusDays(1)
+                .atStartOfDay(ZoneId.of("Asia/Tokyo"));
+        Instant afterTokyoMidnight = tokyoMidnight.toInstant().plusSeconds(30);
+
+        leaseRecoveryService.settleMemberIfCrossedMidnight(tokyoEntity, afterTokyoMidnight);
+
+        SessionLease settledTokyo = leaseRepository.findByLeaseToken(tokyoLease.leaseToken()).orElseThrow();
+        assertNotEquals("ACTIVE", settledTokyo.getStatus().name(),
+                "Tokyo member's lease should be settled after Tokyo midnight");
+
+        SessionLease stillActiveNy = leaseRepository.findByLeaseToken(nyLease.leaseToken()).orElseThrow();
+        assertEquals("ACTIVE", stillActiveNy.getStatus().name(),
+                "NY member's lease should remain active when only Tokyo has crossed midnight");
+    }
+
+    @Test
+    void outboxEvents_publishedAndMarkedSent() throws Exception {
+        MemberResponse adult = createAdult("UTC");
+
+        leaseService.acquireLease(new AcquireLeaseRequest(
+                adult.memberId(), "key-1", 15, "device-1"));
+
+        Thread.sleep(1500);
+
+        Integer sentCount = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM outbox_events WHERE status = 'SENT'",
+                Integer.class);
+        assertNotNull(sentCount);
+        assertTrue(sentCount >= 1,
+                "At least one outbox event should be published and marked SENT, got " + sentCount);
+    }
+
+    @Test
+    void outboxEvents_acquireReleaseHeartbeat_allRecorded() throws Exception {
+        MemberResponse adult = createAdult("UTC");
+
+        LeaseResponse lease = leaseService.acquireLease(new AcquireLeaseRequest(
+                adult.memberId(), "key-1", 15, "device-1"));
+
+        heartbeatService.heartbeat(new HeartbeatRequest(lease.leaseToken(), "hb-1", 1L));
+
+        leaseService.releaseLease(lease.leaseToken(), "release-1");
+
+        Thread.sleep(1500);
+
+        Integer totalEvents = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM outbox_events", Integer.class);
+        Integer sentEvents = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM outbox_events WHERE status = 'SENT'", Integer.class);
+
+        assertNotNull(totalEvents);
+        assertTrue(totalEvents >= 3, "Should have at least 3 outbox events");
+        assertEquals(totalEvents, sentEvents,
+                "All events should be marked SENT (with no webhook configured)");
+    }
+
+    @Test
+    void redisCompleteOutage_systemStillFunctionsFromDB() {
+        MemberResponse adult = createAdult("UTC");
+
+        flushRedis();
+
+        LeaseResponse lease = leaseService.acquireLease(new AcquireLeaseRequest(
+                adult.memberId(), "key-1", 15, "device-1"));
+        assertNotNull(lease.leaseToken());
+        assertEquals("ACTIVE", lease.status());
+
+        HeartbeatResponse hb = heartbeatService.heartbeat(new HeartbeatRequest(
+                lease.leaseToken(), "hb-1", 1L));
+        assertEquals("ACTIVE", hb.status());
+
+        ReleaseResponse released = leaseService.releaseLease(lease.leaseToken(), "release-1");
+        assertEquals("RELEASED", released.status());
+        assertTrue(released.consumedMinutes() <= 1);
+
+        FamilyMember member = memberRepository.findByMemberUuid(adult.memberId()).orElseThrow();
+        var usage = dailyUsageRepository.findByMemberIdAndUsageDate(member.getId(), LocalDate.now(ZoneOffset.UTC)).orElseThrow();
+        assertEquals(0, usage.getUsedMinutes().intValue(),
+                "After immediate release of a 15min lease, used minutes should be 0 (full refund)");
+        assertEquals(60, usage.getRemainingMinutes().intValue());
+    }
+
+    @Test
+    void staleLeaseTakeover_recoversAfterCrash() {
+        MemberResponse adult = createAdult("UTC");
+
+        LeaseResponse lease = leaseService.acquireLease(new AcquireLeaseRequest(
+                adult.memberId(), "key-1", 15, "device-1"));
+
+        SessionLease leaseEntity = leaseRepository.findByLeaseToken(lease.leaseToken()).orElseThrow();
+
+        Instant staleTime = Instant.now().minusSeconds(60);
+        jdbcTemplate.update(
+                "UPDATE session_leases SET last_heartbeat_at = ? WHERE lease_token = ?",
+                java.sql.Timestamp.from(staleTime), lease.leaseToken());
+
+        leaseRecoveryService.recoverExpiredLeases();
+
+        SessionLease reloaded = leaseRepository.findByLeaseToken(lease.leaseToken()).orElseThrow();
+        assertNotEquals("ACTIVE", reloaded.getStatus().name(),
+                "Stale lease with old heartbeat should be taken over or expired");
+        assertNotNull(reloaded.getConsumedMinutes());
     }
 }

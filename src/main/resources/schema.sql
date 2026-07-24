@@ -39,9 +39,11 @@ CREATE TABLE IF NOT EXISTS session_leases (
     started_at          TIMESTAMPTZ NOT NULL,
     expires_at          TIMESTAMPTZ NOT NULL,
     last_heartbeat_at   TIMESTAMPTZ NOT NULL,
+    heartbeat_seq       BIGINT NOT NULL DEFAULT 0,
+    last_client_seq     BIGINT NOT NULL DEFAULT 0,
     ended_at            TIMESTAMPTZ,
     consumed_minutes    INTEGER,
-    prev_lease_token    UUID REFERENCES session_leases(id),
+    prev_lease_token    UUID,
     version             BIGINT NOT NULL DEFAULT 0,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (member_id, idempotency_key)
@@ -51,6 +53,12 @@ CREATE TABLE IF NOT EXISTS session_leases (
 CREATE UNIQUE INDEX IF NOT EXISTS uq_active_lease_per_member
     ON session_leases (member_id)
     WHERE status = 'ACTIVE';
+
+CREATE INDEX IF NOT EXISTS idx_leases_heartbeat_seq
+    ON session_leases (lease_token, heartbeat_seq);
+
+CREATE INDEX IF NOT EXISTS idx_leases_status_expires
+    ON session_leases (status, expires_at);
 
 -- Extension approvals
 CREATE TABLE IF NOT EXISTS extension_approvals (
@@ -69,8 +77,6 @@ CREATE TABLE IF NOT EXISTS extension_approvals (
     UNIQUE (member_id, idempotency_key)
 );
 
--- Index to enforce "at most one extension per local day" when APPROVED
--- We handle the daily limit in application logic with locking, but add a helper index
 CREATE INDEX IF NOT EXISTS idx_extensions_member_date
     ON extension_approvals (member_id, requested_at);
 
@@ -84,7 +90,8 @@ CREATE TABLE IF NOT EXISTS outbox_events (
     payload         JSONB NOT NULL,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     published_at    TIMESTAMPTZ,
-    status          VARCHAR(16) NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING','SENT','FAILED'))
+    status          VARCHAR(16) NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING','SENT','FAILED')),
+    retry_count     INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox_events (created_at) WHERE status = 'PENDING';

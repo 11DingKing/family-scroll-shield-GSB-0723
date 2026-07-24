@@ -46,6 +46,9 @@ app:
   outbox:
     polling-interval-ms: 500
     batch-size: 100
+    webhook-url: ${OUTBOX_WEBHOOK_URL:}
+    max-retries: 5
+    retry-backoff-ms: 1000
 
 logging:
   level:
