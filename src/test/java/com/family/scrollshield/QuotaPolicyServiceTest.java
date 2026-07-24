@@ -140,6 +140,64 @@ class QuotaPolicyServiceTest {
         assertThat(grant.grantedSeconds()).isEqualTo(5 * 60);
     }
 
+    @Test
+    void bedtimeAfterMidnightBlocksLateEveningAndEarlyMorning() {
+        ZoneId ny = ZoneId.of("America/New_York");
+        // Bedtime 00:30 -> blackout window is [23:30 (prev day), 00:30).
+        Member teen = member(AgeGroup.TEEN, "America/New_York", LocalTime.of(0, 30));
+
+        // 23:45 on Jan 15 (local) is inside the window -> blocked.
+        Instant lateEvening = ZonedDateTime.of(2026, 1, 15, 23, 45, 0, 0, ny).toInstant();
+        assertThat(policyAt(lateEvening).inBedtimeBlackout(teen, lateEvening)).isTrue();
+
+        // 00:15 on Jan 16 (local) is still inside the window (before 00:30) -> blocked.
+        Instant earlyMorning = ZonedDateTime.of(2026, 1, 16, 0, 15, 0, 0, ny).toInstant();
+        assertThat(policyAt(earlyMorning).inBedtimeBlackout(teen, earlyMorning)).isTrue();
+
+        // 22:00 on Jan 15 (local), well before 23:30 -> allowed.
+        Instant earlyEvening = ZonedDateTime.of(2026, 1, 15, 22, 0, 0, 0, ny).toInstant();
+        assertThat(policyAt(earlyEvening).inBedtimeBlackout(teen, earlyEvening)).isFalse();
+
+        // 01:00 on Jan 16 (local), just after bedtime -> allowed again.
+        Instant afterBed = ZonedDateTime.of(2026, 1, 16, 1, 0, 0, 0, ny).toInstant();
+        assertThat(policyAt(afterBed).inBedtimeBlackout(teen, afterBed)).isFalse();
+    }
+
+    @Test
+    void bedtimeAfterMidnightDeadlineIsExactlyOneHourBeforeNextBedtime() {
+        ZoneId ny = ZoneId.of("America/New_York");
+        Member teen = member(AgeGroup.TEEN, "America/New_York", LocalTime.of(0, 30));
+
+        // At 22:00 on Jan 15, the next bedtime is 00:30 on Jan 16; deadline = 23:30 Jan 15.
+        Instant at22 = ZonedDateTime.of(2026, 1, 15, 22, 0, 0, 0, ny).toInstant();
+        OffsetDateTime deadline = policyAt(at22).bedtimeDeadline(teen, at22).orElseThrow();
+        ZonedDateTime local = deadline.toInstant().atZone(ny);
+        assertThat(local.toLocalTime()).isEqualTo(LocalTime.of(23, 30));
+        assertThat(local.toLocalDate()).isEqualTo(LocalDate.of(2026, 1, 15));
+    }
+
+    @Test
+    void bedtimeBlackoutIsOneRealHourAcrossDstFallBack() {
+        // On the DST fall-back night (Nov 1, 2026) the wall-clock hour 01:00-02:00 repeats.
+        // A bedtime of 01:45 must still yield a blackout that begins exactly one *real* hour
+        // (3600 seconds) before the bedtime instant, not one wall-clock hour.
+        ZoneId ny = ZoneId.of("America/New_York");
+        Member teen = member(AgeGroup.TEEN, "America/New_York", LocalTime.of(1, 45));
+
+        Instant from = ZonedDateTime.of(2026, 11, 1, 0, 0, 0, 0, ny).toInstant();
+        QuotaPolicyService policy = policyAt(from);
+        OffsetDateTime deadline = policy.bedtimeDeadline(teen, from).orElseThrow();
+
+        // Bedtime instant the policy targeted is the next 01:45 strictly after `from`.
+        Instant bedtimeInstant = ZonedDateTime.of(2026, 11, 1, 1, 45, 0, 0, ny).toInstant();
+        long gap = java.time.Duration.between(deadline.toInstant(), bedtimeInstant).getSeconds();
+        assertThat(gap).isEqualTo(3600);
+
+        // Exactly at the deadline no session time remains before the blackout.
+        assertThat(policyAt(deadline.toInstant()).secondsAvailableBeforeBedtime(
+                teen, deadline.toInstant(), 5 * 60)).isZero();
+    }
+
     private ViewingPlan openPlan(Member m) {
         return ViewingPlan.builder()
                 .id(UUID.randomUUID())

@@ -10,7 +10,6 @@ import java.time.DateTimeException;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
-import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.OffsetDateTime;
 import java.time.ZoneId;
@@ -116,9 +115,23 @@ public class QuotaPolicyService {
     }
 
     /**
-     * The instant at which viewing must stop today because of the bedtime blackout
-     * (bedtime minus one hour), expressed in the member's zone. Empty when the member
-     * has no bedtime configured. DST is handled via {@link ZonedDateTime} resolution.
+     * The member-local start-of-day (midnight) instant for a date. DST-safe: a midnight
+     * that does not exist due to a spring-forward gap is resolved by {@link ZonedDateTime}.
+     */
+    public Instant startOfDay(Member member, LocalDate date) {
+        return ZonedDateTime.of(date, LocalTime.MIDNIGHT, zoneOf(member)).toInstant();
+    }
+
+    /**
+     * The instant at which viewing must stop because of the bedtime blackout: one hour
+     * before the <em>next</em> daily bedtime occurrence strictly after {@code instant}.
+     *
+     * <p>Modelling the deadline off the next upcoming bedtime (rather than the instant's
+     * own calendar date) makes the one-hour blackout window {@code [bedtime-1h, bedtime]}
+     * correct even when bedtime falls after midnight. For a 00:30 bedtime this yields a
+     * window of 23:30 (previous day) through 00:30, so late-evening and early-morning
+     * viewing are both blocked. Empty when the member has no bedtime configured. DST gaps
+     * and overlaps are resolved deterministically by {@link ZonedDateTime}.
      */
     public Optional<OffsetDateTime> bedtimeDeadline(Member member, Instant instant) {
         LocalTime bedtime = member.getBedtimeLocal();
@@ -127,11 +140,14 @@ public class QuotaPolicyService {
         }
         ZoneId zone = zoneOf(member);
         LocalDate localDate = instant.atZone(zone).toLocalDate();
-        LocalTime blackoutStart = bedtime.minusHours((int) BEDTIME_BLACKOUT.toHours());
-        LocalDateTime deadlineLocal = LocalDateTime.of(localDate, blackoutStart);
-        // ZonedDateTime resolves gaps/overlaps from DST transitions deterministically.
-        ZonedDateTime zoned = deadlineLocal.atZone(zone);
-        return Optional.of(zoned.toOffsetDateTime());
+        // Soonest daily bedtime occurrence strictly after the instant.
+        ZonedDateTime nextBedtime = ZonedDateTime.of(localDate, bedtime, zone);
+        if (!nextBedtime.toInstant().isAfter(instant)) {
+            nextBedtime = ZonedDateTime.of(localDate.plusDays(1), bedtime, zone);
+        }
+        // Blackout starts one real hour before that bedtime.
+        ZonedDateTime blackoutStart = nextBedtime.minus(BEDTIME_BLACKOUT);
+        return Optional.of(blackoutStart.toOffsetDateTime());
     }
 
     /** True when the member is currently inside (at or past) the bedtime blackout window. */

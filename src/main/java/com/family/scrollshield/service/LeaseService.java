@@ -204,15 +204,15 @@ public class LeaseService {
         Member member = memberService.requireById(lease.getMemberId());
         Instant now = quotaPolicy.now();
 
-        // Cross-midnight: settle the session against the old day and close it. The client
-        // must acquire a fresh lease for the new member-local day.
-        if (quotaPolicy.hasCrossedMidnight(member, lease.getGrantedAt().atZoneSameInstant(quotaPolicy.zoneOf(member)).toLocalDate(), now)) {
-            ViewingPlan oldPlan = planRepository.lockById(lease.getPlanId())
-                    .orElseThrow(() -> new LeaseException(LeaseException.Code.LEASE_NOT_ACTIVE, "plan missing"));
-            SettleResult settled = settleAndClose(member, lease, oldPlan, now, LeaseStatus.CROSSED_MIDNIGHT);
-            return new HeartbeatResponse(lease.getId(), LeaseStatus.CROSSED_MIDNIGHT,
-                    lease.getExpiresAt(), settled.increment(), lease.getConsumedSecondsTotal(),
-                    oldPlan.getConsumedSeconds(), oldPlan.remainingSeconds(), true);
+        // Cross-midnight: the session spanned the member-local midnight boundary. Split the
+        // unsettled time so [lastHeartbeat, midnight) bills to the old day and [midnight, now]
+        // bills to the new day. The lease is then closed; the client must acquire a fresh
+        // lease for the new day. This avoids over-charging the old day and never drops the
+        // after-midnight viewing time.
+        LocalDate grantDate = lease.getGrantedAt()
+                .atZoneSameInstant(quotaPolicy.zoneOf(member)).toLocalDate();
+        if (quotaPolicy.hasCrossedMidnight(member, grantDate, now)) {
+            return settleCrossMidnight(member, lease, grantDate, now, clientNow);
         }
 
         ViewingPlan plan = planRepository.lockById(lease.getPlanId())
@@ -286,12 +286,13 @@ public class LeaseService {
     }
 
     /**
-     * Bill server-observed elapsed time since the last heartbeat into the plan, clamped to
-     * the single-session grant and the remaining daily budget. Monotonic: never decreases
-     * consumption, so duplicate or out-of-order heartbeats add zero.
+     * Bill server-observed elapsed time since the last heartbeat into the plan, up to the
+     * given {@code upTo} instant, clamped to the single-session grant and the remaining
+     * daily budget. Monotonic: never decreases consumption, so duplicate or out-of-order
+     * heartbeats add zero. Advances the lease's last-heartbeat watermark to {@code upTo}.
      */
-    private SettleResult settleElapsed(Member member, SessionLease lease, ViewingPlan plan, Instant now) {
-        long elapsed = Duration.between(lease.getLastHeartbeatAt().toInstant(), now).getSeconds();
+    private SettleResult settleElapsed(Member member, SessionLease lease, ViewingPlan plan, Instant upTo) {
+        long elapsed = Duration.between(lease.getLastHeartbeatAt().toInstant(), upTo).getSeconds();
         if (elapsed < 0) {
             elapsed = 0; // out-of-order / clock skew: never bill negative time
         }
@@ -311,6 +312,8 @@ public class LeaseService {
             plan.setConsumedSeconds(plan.getConsumedSeconds() + increment);
             planRepository.save(plan);
         }
+        // Advance the watermark so a subsequent split segment is not double-billed.
+        lease.setLastHeartbeatAt(upTo.atOffset(ZoneOffset.UTC));
 
         boolean sessionDone = newLeaseTotal >= lease.getSessionGrantedSeconds();
         boolean dailyDone = plan.remainingSeconds() <= 0;
@@ -323,6 +326,98 @@ public class LeaseService {
         SettleResult result = settleElapsed(member, lease, plan, now);
         finalizeTermination(member, lease, plan, now, terminalStatus);
         return result;
+    }
+
+    /**
+     * Bill exactly {@code seconds} of viewing into {@code plan}, clamped to the remaining
+     * single-session grant and this plan's remaining daily budget. Increments the lease's
+     * cumulative total and the plan's consumption in lock-step. Returns seconds billed.
+     */
+    private int billSegment(SessionLease lease, ViewingPlan plan, long seconds) {
+        if (seconds <= 0) {
+            return 0;
+        }
+        int sessionRemaining = Math.max(0, lease.getSessionGrantedSeconds() - lease.getConsumedSecondsTotal());
+        int planRemaining = plan.remainingSeconds();
+        int bill = (int) Math.min(seconds, Math.min(sessionRemaining, planRemaining));
+        if (bill <= 0) {
+            return 0;
+        }
+        lease.setConsumedSecondsTotal(lease.getConsumedSecondsTotal() + bill);
+        plan.setConsumedSeconds(plan.getConsumedSeconds() + bill);
+        planRepository.save(plan);
+        return bill;
+    }
+
+    /**
+     * Handle a heartbeat whose session spanned member-local midnight. The unsettled span
+     * {@code [lastHeartbeat, now]} is split at midnight: the pre-midnight seconds settle
+     * into the old day's plan and the post-midnight seconds into the new day's plan
+     * (created if necessary). The single-session cap is shared across the split, so total
+     * billed time is still bounded, while each day's daily budget is enforced independently.
+     * The lease is closed as {@link LeaseStatus#CROSSED_MIDNIGHT}; the client re-acquires.
+     */
+    private HeartbeatResponse settleCrossMidnight(Member member, SessionLease lease,
+                                                  LocalDate grantDate, Instant now,
+                                                  OffsetDateTime clientNow) {
+        Instant lastHeartbeat = lease.getLastHeartbeatAt().toInstant();
+        // First member-local midnight after the grant day.
+        Instant midnight = quotaPolicy.startOfDay(member, grantDate.plusDays(1));
+
+        long preSeconds = Math.max(0, Duration.between(lastHeartbeat, midnight).getSeconds());
+        Instant postStart = lastHeartbeat.isAfter(midnight) ? lastHeartbeat : midnight;
+        long postSeconds = Math.max(0, Duration.between(postStart, now).getSeconds());
+
+        // Settle the pre-midnight remainder into the old day's plan.
+        ViewingPlan oldPlan = planRepository.lockById(lease.getPlanId())
+                .orElseThrow(() -> new LeaseException(LeaseException.Code.LEASE_NOT_ACTIVE, "plan missing"));
+        int oldIncrement = billSegment(lease, oldPlan, preSeconds);
+
+        // Settle the post-midnight time into the current member-local day's plan.
+        LocalDate today = quotaPolicy.memberLocalDate(member, now);
+        ViewingPlan newPlan = planService.getOrCreatePlan(member, today);
+        newPlan = planRepository.lockById(newPlan.getId())
+                .orElseThrow(() -> new LeaseException(LeaseException.Code.LEASE_NOT_ACTIVE, "plan missing"));
+        int newIncrement = billSegment(lease, newPlan, postSeconds);
+
+        int totalIncrement = oldIncrement + newIncrement;
+
+        // Audit: record the settlement against each affected plan.
+        if (oldIncrement > 0) {
+            heartbeatRepository.save(LeaseHeartbeat.builder()
+                    .leaseId(lease.getId())
+                    .observedAt(midnight.atOffset(ZoneOffset.UTC))
+                    .clientNow(clientNow)
+                    .incrementSeconds(oldIncrement)
+                    .totalConsumed(lease.getConsumedSecondsTotal() - newIncrement)
+                    .nextExpiresAt(midnight.atOffset(ZoneOffset.UTC))
+                    .build());
+            outbox.record(AggregateTypes.LEASE, lease.getId(), EventTypes.HEARTBEAT,
+                    new HeartbeatPayload(lease.getId(), member.getId(), oldPlan.getId(), oldIncrement,
+                            lease.getConsumedSecondsTotal() - newIncrement, oldPlan.getConsumedSeconds(),
+                            midnight.atOffset(ZoneOffset.UTC), midnight.atOffset(ZoneOffset.UTC)));
+        }
+        if (newIncrement > 0) {
+            heartbeatRepository.save(LeaseHeartbeat.builder()
+                    .leaseId(lease.getId())
+                    .observedAt(now.atOffset(ZoneOffset.UTC))
+                    .clientNow(clientNow)
+                    .incrementSeconds(newIncrement)
+                    .totalConsumed(lease.getConsumedSecondsTotal())
+                    .nextExpiresAt(now.atOffset(ZoneOffset.UTC))
+                    .build());
+            outbox.record(AggregateTypes.LEASE, lease.getId(), EventTypes.HEARTBEAT,
+                    new HeartbeatPayload(lease.getId(), member.getId(), newPlan.getId(), newIncrement,
+                            lease.getConsumedSecondsTotal(), newPlan.getConsumedSeconds(),
+                            now.atOffset(ZoneOffset.UTC), now.atOffset(ZoneOffset.UTC)));
+        }
+
+        // Close the lease against the new day's plan (the day it ended in).
+        finalizeTermination(member, lease, newPlan, now, LeaseStatus.CROSSED_MIDNIGHT);
+
+        return new HeartbeatResponse(lease.getId(), LeaseStatus.CROSSED_MIDNIGHT,
+                lease.getExpiresAt(), totalIncrement, lease.getConsumedSecondsTotal(),
+                newPlan.getConsumedSeconds(), newPlan.remainingSeconds(), true);
     }
 
     private void finalizeTermination(Member member, SessionLease lease, ViewingPlan plan,
